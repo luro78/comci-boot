@@ -1,0 +1,31 @@
+# 컴시간 접속 정보 자동 수집
+# 30분마다 화면 없는 크롬으로 컴시간을 열어 접속 정보를 알아내고,
+# 값이 바뀌었을 때만 comci-boot.json 을 고쳐 저장합니다.
+name: comci-boot
+on:
+  workflow_dispatch:          # [Run workflow] 버튼으로 바로 실행
+  schedule:
+    - cron: '7,37 * * * *'    # 매시 7분, 37분 (GitHub 사정으로 몇 분 늦을 수 있음)
+permissions:
+  contents: write
+concurrency: comci-boot
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: 컴시간 접속 정보 알아내기
+        env:
+          COMCI_CHROME_ARGS: --no-sandbox
+        run: python3 comci_capture.py --school "${{ vars.COMCI_SCHOOL || '연제중' }}" --out comci-boot.json
+      - name: 바뀌었으면 저장
+        run: |
+          if git diff --quiet -- comci-boot.json && git ls-files --error-unmatch comci-boot.json >/dev/null 2>&1; then
+            echo "변경 없음"; exit 0
+          fi
+          git config user.name "comci-boot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add comci-boot.json
+          git commit -m "컴시간 접속 정보 갱신"
+          git push
