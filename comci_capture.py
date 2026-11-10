@@ -1,23 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-컴시간 접속 정보 수집기
+컴시간 시간표 수집기 (2026-11-07 이후 암호화 대응)
 
-2026년 11월부터 컴시간 알리미는 페이지 스크립트를 알아볼 수 없게 바꾸고, 시간표 자료 주소를 하루에도 여러 번 바꿉니다.
-그래서 크롬(또는 엣지)을 화면 없이 띄워 실제로 컴시간을 열고 학교를 검색·선택한 뒤,
-그때 페이지가 보내는 요청 주소에서 접속 정보를 알아냅니다.
+2026년 11월 7일부터 컴시간 알리미는 시간표·학교 검색 응답을 암호화('enc5:…')해서 보냅니다.
+그래서 크롬(또는 엣지)을 화면 없이 띄워 실제로 컴시간을 열고, 학교를 검색·선택한 뒤
+페이지가 스스로 푼 직후(JSON.parse)의 시간표를 가로챕니다. 주 선택 목록의 주(보통 이번 주·다음 주)를 모두 받습니다.
 
-  주소(route)   : http://comci.net:4082/<route>?...
-  검색(search)  : <route>?<search>l<학교이름>
-  앞부분(prefix): <route>?base64('<prefix><학교코드>_0_<주차><suffix>')
-  꼬리(suffix)  : 2026-11-05부터 붙는 '_enc2' 같은 끝부분
+결과: { code, name, region, changedAt, weeks: [ { r, label, raw } ] }   (raw = 컴시간이 푼 시간표 원본)
 
 파이썬 기본 기능만 씁니다 (추가 설치 없음). 크롬 원격 디버깅(CDP)으로 브라우저를 움직입니다.
 
 사용법
-  python comci_capture.py                       결과를 화면에 표시
-  python comci_capture.py --out comci-boot.json 결과를 파일로 저장 (값이 바뀌었을 때만 capturedAt 갱신)
-  python comci_capture.py --school 연제중        검색할 학교 이름 (기본: 연제중)
-  환경변수 CHROME_PATH 로 브라우저 실행 파일을, COMCI_HOST 로 컴시간 주소를 바꿀 수 있습니다.
+  python comci_capture.py --school 연제중                     결과 요약을 화면에 표시
+  python comci_capture.py --school 연제중 --out timetable.json 결과를 파일로 저장 (시간표가 바뀌었을 때만 고침)
+  python comci_capture.py --school 연제중학교 --code 12345      같은 이름 학교가 여럿이면 학교 코드로 고름
+  환경변수 CHROME_PATH 로 브라우저 실행 파일을, COMCI_HOST 로 컴시간 주소를, COMCI_CHROME_ARGS 로 브라우저 옵션을 바꿀 수 있습니다.
 """
 import base64
 import json
@@ -194,28 +191,38 @@ class CDP:
             self.call("Input.dispatchKeyEvent", p)
 
 
-# ───────────────────── 요청 주소에서 접속 정보 뽑기 ─────────────────────
-def analyze(urls, host=COMCI_HOST):
-    out = {}
-    hp = re.escape(urllib.parse.urlparse(host).netloc)
-    for u in urls:
-        m = re.match(r"^https?://" + hp + r"/(\d+)\?(.+)$", u)
-        if not m:
-            continue
-        route, q = m.group(1), m.group(2)
-        s = re.match(r"^(\d+l)", q)
-        if s:
-            out["route"], out["search"] = route, s.group(1)
-            continue
-        try:
-            raw = base64.b64decode(urllib.parse.unquote(q) + "===").decode("latin1")
-        except Exception:
-            continue
-        p = re.match(r"^(\d*_)(\d+)_0_\d+(_\w+)?$", raw)
-        if p:
-            out["route"], out["prefix"], out["suffix"] = route, p.group(1), p.group(3) or ""
-            out["schoolCode"] = p.group(2)
-    return out
+# ───────────────────── 페이지에 심는 코드 ─────────────────────
+# 페이지 스크립트보다 먼저 실행되어 JSON.parse 를 감싼다 → 페이지가 푼 시간표·검색 결과를 모아 둔다
+JS_INIT = r"""(() => {
+  window.__comci = [];
+  const orig = JSON.parse;
+  JSON.parse = function (t, r) {
+    const v = orig.call(this, t, r);
+    try { if (v && typeof v === 'object' && (v['학급수'] || v['학교검색'])) window.__comci.push(v); } catch (e) {}
+    return v;
+  };
+})();"""
+
+JS_TAKE = "(() => (window.__comci || []).splice(0))()"
+
+# 검색 결과에서 onclick="sc_disp(코드)" 항목들 (코드는 여기서만 진짜 — 검색 결과 숫자는 가짜)
+JS_SCHOOLS = r"""(() => [...document.querySelectorAll('[onclick]')]
+  .filter(e => /sc_disp\(\s*\d+/.test(e.getAttribute('onclick') || ''))
+  .map(e => { e.scrollIntoView({block: 'center'}); const r = e.getBoundingClientRect();
+    return { code: (e.getAttribute('onclick').match(/sc_disp\(\s*(\d+)/) || [])[1], text: (e.innerText || '').trim(),
+             x: r.x + r.width / 2, y: r.y + r.height / 2 }; }))()"""
+
+JS_CLICK_CODE = r"""((code) => { const e = [...document.querySelectorAll('[onclick]')]
+  .find(x => new RegExp('sc_disp\\(\\s*' + code + '\\b').test(x.getAttribute('onclick') || ''));
+  if (!e) return false; e.click(); return true; })"""
+
+# 주 선택 목록 (option 글자에 '~' 가 있는 select)
+JS_WEEKS = r"""(() => { const s = [...document.querySelectorAll('select')].find(s => [...s.options].some(o => /~/.test(o.text)));
+  if (!s) return null; return { sel: s.selectedIndex, texts: [...s.options].map(o => o.text.trim()) }; })()"""
+
+JS_PICK_WEEK = r"""((i) => { const s = [...document.querySelectorAll('select')].find(s => [...s.options].some(o => /~/.test(o.text)));
+  if (!s) return null; s.selectedIndex = i; s.dispatchEvent(new Event('change', {bubbles: true}));
+  return s.options[i] ? s.options[i].text.trim() : ''; })"""
 
 
 # 화면에 보이는 첫 글자 입력칸 좌표
@@ -237,18 +244,19 @@ JS_BUTTON = r"""(() => {
   const r = list[0].getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2];
 })()"""
 
-# 학교 이름이 들어 있는 가장 작은(안쪽) 요소들의 좌표
-JS_SCHOOL = r"""((name) => {
-  const vis = e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e);
-    return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; };
-  const all = [...document.querySelectorAll('body *')].filter(e =>
-    e.tagName !== 'INPUT' && e.tagName !== 'SCRIPT' && vis(e) && (e.innerText || '').indexOf(name) >= 0 && !/검색/.test(e.innerText || ''));
-  const leaf = all.filter(e => ![...e.children].some(c => (c.innerText || '').indexOf(name) >= 0));
-  return leaf.slice(0, 8).map(e => { e.scrollIntoView({block: 'center'}); const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; });
-})"""
+def _week_of(raw, label, fallback):
+    for row in raw.get("일자자료") or []:
+        try:
+            if str(row[1]).strip() == str(label).strip():
+                return int(row[0])
+        except Exception:
+            pass
+    return fallback
 
 
-def capture(school=DEFAULT_SCHOOL, host=COMCI_HOST, browser=None, log=print, keep_open=False):
+def capture(school=DEFAULT_SCHOOL, host=None, browser=None, log=print, code=None, region=None):
+    """학교를 검색·선택해 주별 해독된 시간표를 모은다 → {code, name, region, weeks}"""
+    host = host or COMCI_HOST
     browser = browser or find_browser()
     if not browser:
         raise RuntimeError("크롬이나 엣지를 찾지 못했습니다.")
@@ -257,9 +265,9 @@ def capture(school=DEFAULT_SCHOOL, host=COMCI_HOST, browser=None, log=print, kee
     args = [browser, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
             "--disable-extensions", "--remote-debugging-port=%d" % port, "--user-data-dir=" + profile,
             "--window-size=1280,900", "--lang=ko-KR"]
-    args += [x for x in os.environ.get("COMCI_CHROME_ARGS", "").split() if x]   # 필요하면 브라우저 옵션 추가
+    args += [x for x in os.environ.get("COMCI_CHROME_ARGS", "").split() if x]
     args.append("about:blank")
-    if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+    if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0 and "--no-sandbox" not in args:
         args.insert(1, "--no-sandbox")
     flags = 0x08000000 if os.name == "nt" else 0          # CREATE_NO_WINDOW
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
@@ -282,6 +290,7 @@ def capture(school=DEFAULT_SCHOOL, host=COMCI_HOST, browser=None, log=print, kee
         cdp = CDP(ws)
         cdp.call("Network.enable")
         cdp.call("Page.enable")
+        cdp.call("Page.addScriptToEvaluateOnNewDocument", {"source": JS_INIT})
         cdp.call("Page.navigate", {"url": host + "/st"})
         cdp.pump(4)
         for _ in range(10):                                  # 입력칸이 나올 때까지 (최대 5초 더)
@@ -295,21 +304,62 @@ def capture(school=DEFAULT_SCHOOL, host=COMCI_HOST, browser=None, log=print, kee
         cdp.call("Input.insertText", {"text": school})
         cdp.enter()
         cdp.pump(3)
-        if not analyze(cdp.urls, host).get("search"):
+        found = cdp.js(JS_SCHOOLS) or []
+        if not found:
             btn = cdp.js(JS_BUTTON)
             if btn:
                 cdp.click(btn[0], btn[1])
                 cdp.pump(3)
-        for p in (cdp.js("(" + JS_SCHOOL + ")(" + json.dumps(school) + ")") or []):
-            if analyze(cdp.urls, host).get("prefix") is not None:
-                break
-            cdp.click(p[0], p[1])
+                found = cdp.js(JS_SCHOOLS) or []
+        decoded = [v for v in (cdp.js(JS_TAKE) or []) if isinstance(v, dict) and v.get("학교검색")]
+        regions = {}
+        for v in decoded:
+            for row in v.get("학교검색") or []:
+                if isinstance(row, list) and len(row) >= 3:
+                    regions.setdefault(str(row[2]).strip(), str(row[1]).strip())
+        if not found:
+            raise RuntimeError("컴시간에서 '%s'(으)로 검색한 결과가 없습니다." % school)
+        if code:
+            hits = [f for f in found if str(f.get("code")) == str(code)]
+        else:
+            hits = [f for f in found if f.get("text") == school] or [f for f in found if school in (f.get("text") or "")]
+            if region:
+                hits = [f for f in hits if region in regions.get(f.get("text"), "")] or hits
+        if not hits:
+            raise RuntimeError("검색 결과에 맞는 학교가 없습니다. 찾은 학교: " + ", ".join("%s(%s)" % (f.get("text"), f.get("code")) for f in found[:8]))
+        hit = hits[0]
+        if len(hits) > 1:
+            log("같은 이름 학교가 %d곳이라 첫 번째(%s, 코드 %s)를 씁니다. --code 로 고를 수 있습니다." % (len(hits), hit["text"], hit["code"]))
+        cdp.click(hit["x"], hit["y"])
+        cdp.pump(3)
+        raws = [v for v in (cdp.js(JS_TAKE) or []) if isinstance(v, dict) and v.get("학급수")]
+        if not raws:                                         # 마우스 클릭이 안 먹으면 직접 누름
+            cdp.js("(" + JS_CLICK_CODE + ")(" + json.dumps(str(hit["code"])) + ")")
             cdp.pump(3)
-        res = analyze(cdp.urls, host)
-        if not res.get("route") or not res.get("search") or res.get("prefix") is None:
-            seen = [u for u in cdp.urls if urllib.parse.urlparse(u).netloc == urllib.parse.urlparse(host).netloc]
-            raise RuntimeError("접속 정보를 다 찾지 못했습니다. 찾은 것: %s / 컴시간 요청 %d건" % (json.dumps(res, ensure_ascii=False), len(seen)))
-        return res
+            raws = [v for v in (cdp.js(JS_TAKE) or []) if isinstance(v, dict) and v.get("학급수")]
+        if not raws:
+            raise RuntimeError("학교를 골랐지만 시간표를 가로채지 못했습니다 (컴시간 화면이 바뀌었을 수 있음).")
+        weeks = {}
+        info = cdp.js(JS_WEEKS)
+        first_label = info["texts"][info["sel"]] if info and 0 <= info["sel"] < len(info["texts"]) else ""
+        r0 = _week_of(raws[-1], first_label, 1)
+        weeks[r0] = {"r": r0, "label": first_label, "raw": raws[-1]}
+        if info:
+            for i, label in enumerate(info["texts"]):
+                if i == info["sel"]:
+                    continue
+                cdp.js("(" + JS_PICK_WEEK + ")(%d)" % i)
+                cdp.pump(2.5)
+                got = [v for v in (cdp.js(JS_TAKE) or []) if isinstance(v, dict) and v.get("학급수")]
+                if not got:
+                    cdp.pump(1.5)
+                    got = [v for v in (cdp.js(JS_TAKE) or []) if isinstance(v, dict) and v.get("학급수")]
+                if got:
+                    r = _week_of(got[-1], label, i + 1)
+                    weeks.setdefault(r, {"r": r, "label": label, "raw": got[-1]})
+        name = hit.get("text") or school
+        return {"code": int(hit["code"]), "name": name, "region": regions.get(name, ""),
+                "weeks": [weeks[k] for k in sorted(weeks)]}
     finally:
         if ws:
             ws.close()
@@ -325,37 +375,45 @@ def capture(school=DEFAULT_SCHOOL, host=COMCI_HOST, browser=None, log=print, kee
 
 
 def save_if_changed(path, res):
-    """값이 바뀌었을 때만 파일을 고친다 (같으면 그대로 → 저장소에 커밋이 쌓이지 않음)"""
+    """시간표가 바뀌었을 때만 파일을 고친다 (같으면 그대로 → 저장소에 커밋이 쌓이지 않음)"""
     prev = {}
     try:
         with open(path, encoding="utf-8") as f:
             prev = json.load(f)
     except Exception:
         pass
-    keys = ("route", "search", "prefix", "suffix")
-    if all(str(prev.get(k, "")) == str(res.get(k, "")) for k in keys) and prev.get("capturedAt"):
+    same = (prev.get("code") == res["code"] and prev.get("name") == res["name"]
+            and json.dumps(prev.get("weeks"), ensure_ascii=False, sort_keys=True) == json.dumps(res["weeks"], ensure_ascii=False, sort_keys=True))
+    if same and prev.get("changedAt"):
         return False
-    out = {k: res.get(k, "") for k in keys}
-    out["capturedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    out["note"] = "컴시간 접속 정보 (comci_capture.py 가 실제 브라우저로 알아낸 값)"
+    out = {"code": res["code"], "name": res["name"], "region": res.get("region", ""),
+           "changedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "note": "컴시간 시간표 (comci_capture.py 가 실제 브라우저로 가로챈, 컴시간이 푼 원본)",
+           "weeks": res["weeks"]}
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
+        json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
         f.write("\n")
     return True
+
+
+def summary(res):
+    return "%s(%s) %s" % (res["name"], res["code"], ", ".join("%d주 %s" % (w["r"], w["label"]) for w in res["weeks"]))
 
 
 def main():
     a = sys.argv[1:]
     school = a[a.index("--school") + 1] if "--school" in a else DEFAULT_SCHOOL
+    code = a[a.index("--code") + 1] if "--code" in a else None
+    region = a[a.index("--region") + 1] if "--region" in a else None
     try:
-        res = capture(school)
+        res = capture(school, code=code or None, region=region or None)
     except Exception as e:
         print("[실패] " + str(e))
         sys.exit(1)
-    print(json.dumps(res, ensure_ascii=False))
+    print(summary(res))
     if "--out" in a:
         path = a[a.index("--out") + 1]
-        print("파일 갱신" if save_if_changed(path, res) else "값이 같아 그대로 둠")
+        print("파일 갱신" if save_if_changed(path, res) else "시간표가 같아 그대로 둠")
 
 
 if __name__ == "__main__":
