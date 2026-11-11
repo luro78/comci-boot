@@ -1,6 +1,9 @@
-# 컴시간 접속 정보 자동 수집
-# 30분마다 화면 없는 크롬으로 컴시간을 열어 접속 정보를 알아내고,
-# 값이 바뀌었을 때만 comci-boot.json 을 고쳐 저장합니다.
+# 컴시간 시간표 자동 수집
+# 2026-11-07부터 컴시간은 시간표를 암호화해서 보냅니다. 그래서 30분마다 화면 없는 크롬으로
+# 컴시간을 열어 학교를 고르고, 페이지가 푼 시간표(이번 주·다음 주)를 timetable.json 에 저장합니다.
+# 시간표가 바뀌었을 때만 저장(커밋)합니다.
+# 학교를 바꾸려면: 저장소 Settings → Secrets and variables → Actions → Variables 에
+#   COMCI_SCHOOL (학교 이름, 예: 연제중학교), 필요하면 COMCI_CODE (학교 코드) 를 만드세요.
 name: comci-boot
 on:
   workflow_dispatch:          # [Run workflow] 버튼으로 바로 실행
@@ -12,20 +15,20 @@ concurrency: comci-boot
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: 컴시간 접속 정보 알아내기
+      - name: 컴시간 시간표 받기
         env:
           COMCI_CHROME_ARGS: --no-sandbox
-        run: python3 comci_capture.py --school "${{ vars.COMCI_SCHOOL || '연제중' }}" --out comci-boot.json
+        run: python3 comci_capture.py --school "${{ vars.COMCI_SCHOOL || '연제중' }}" --code "${{ vars.COMCI_CODE }}" --out timetable.json
       - name: 바뀌었으면 저장
         run: |
-          if git diff --quiet -- comci-boot.json && git ls-files --error-unmatch comci-boot.json >/dev/null 2>&1; then
+          if git diff --quiet -- timetable.json && git ls-files --error-unmatch timetable.json >/dev/null 2>&1; then
             echo "변경 없음"; exit 0
           fi
           git config user.name "comci-boot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add comci-boot.json
-          git commit -m "컴시간 접속 정보 갱신"
+          git add timetable.json
+          git commit -m "컴시간 시간표 갱신"
           git push
